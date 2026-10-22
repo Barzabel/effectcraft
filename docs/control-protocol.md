@@ -47,14 +47,20 @@ The first request on every connection must be:
 
 It is answered with `{"id": "auth", "ok": true, "result": {"authenticated": true}}`. Any other first
 request, or a wrong token, gets `{"ok": false, "error": "authentication required: …"}` and the
-connection is closed, so nothing sent with it runs. A second `auth` on an authenticated connection
-gets an `already authenticated` error and changes nothing.
+connection is closed, so nothing sent with it runs. A first line that isn't a JSON request object
+at all (an HTTP request, plain text) gets the usual `bad JSON …; closing the connection` or
+`not a control request …` error instead. A connection that hasn't authenticated within 10 seconds
+of connecting is closed (`not authenticated within 10 s of connecting`), however slowly it sends;
+after `auth` there is no such limit. A second `auth` on an authenticated connection gets an
+`already authenticated` error and changes nothing.
 
 `effectcraft-cli --bridge PORT` and `effectcraft-cli mcp --bridge PORT` read the token file
 themselves, again on every reconnect, so they keep working across app restarts. Other clients can
 read it the same way, or take the token from `EFFECTCRAFT_CONTROL_TOKEN` (the CLI uses that variable
 first, then `EFFECTCRAFT_CONTROL_TOKEN_FILE`, then the settings folder). This is the same handshake
-as PhotoCraft's control channel.
+as PhotoCraft's control channel. Prefer the per-launch file: `EFFECTCRAFT_CONTROL_TOKEN` pins a
+secret that is sent to whatever is listening on the port, even after the app has gone. Two app
+instances must not share one `EFFECTCRAFT_CONTROL_TOKEN_FILE`, since each launch replaces it.
 
 Quick test (macOS / Linux, default settings folder):
 

@@ -17,7 +17,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use effectcraft_automation::control_auth;
 use effectcraft_ui_egui::ControlRequest;
@@ -28,6 +28,9 @@ use serde_json::{Value, json};
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Connections served at once; further ones get an error line and are closed.
 pub const MAX_CONNECTIONS: usize = 16;
+/// Time from accepting a connection to its `auth` request (as in PhotoCraft). A connection that
+/// hasn't authenticated by then is closed, so idle or slow-drip peers can't hold every slot.
+pub const AUTH_DEADLINE: Duration = Duration::from_secs(10);
 
 pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
     let (tx, rx) = channel::<ControlRequest>();
@@ -48,7 +51,7 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
         }
     };
     log::info!("control server listening on 127.0.0.1:{port}");
-    std::thread::spawn(move || accept_loop(listener, tx, ctx, token.into()));
+    std::thread::spawn(move || accept_loop(listener, tx, ctx, token.into(), AUTH_DEADLINE));
     rx
 }
 
@@ -61,7 +64,7 @@ fn publish_token(port: u16) -> Result<String, String> {
     Ok(token)
 }
 
-fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, token: Arc<str>) {
+fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, token: Arc<str>, auth_deadline: Duration) {
     let open = Arc::new(AtomicUsize::new(0));
     for mut stream in listener.incoming().flatten() {
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -74,15 +77,15 @@ fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Con
         let open = Arc::clone(&open);
         let token = Arc::clone(&token);
         std::thread::spawn(move || {
-            serve(stream, &token, &tx, &ctx);
+            serve(stream, &token, auth_deadline, &tx, &ctx);
             open.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
 
-fn serve(stream: TcpStream, token: &str, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
+fn serve(stream: TcpStream, token: &str, auth_deadline: Duration, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
     let Ok(read) = stream.try_clone() else { return };
-    serve_lines(read, stream, token, |method, params| {
+    serve_lines(read, stream, token, auth_deadline, |method, params| {
         let (req, rrx) = ControlRequest::new(method, params);
         tx.send(req).ok()?;
         ctx.request_repaint();
@@ -147,6 +150,68 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
     Ok(true)
 }
 
+/// A source whose blocking reads can be bounded: the socket, or an in-memory buffer in tests.
+trait ReadTimeout {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl ReadTimeout for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+}
+
+impl ReadTimeout for &[u8] {
+    fn set_read_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Reads that fail once the connection's auth deadline has passed. The deadline is fixed when the
+/// connection is accepted and checked before every read, with the socket's read timeout set to
+/// what is left, so neither silence nor a byte-at-a-time drip can extend it.
+struct AuthDeadlineRead<R> {
+    inner: R,
+    /// `None` once authenticated.
+    deadline: Option<Instant>,
+    limit: Duration,
+}
+
+impl<R: ReadTimeout> AuthDeadlineRead<R> {
+    fn new(inner: R, limit: Duration) -> Self {
+        // A limit too large to represent expires at once rather than never.
+        let now = Instant::now();
+        Self { inner, deadline: Some(now.checked_add(limit).unwrap_or(now)), limit }
+    }
+
+    /// The connection authenticated: no deadline from here on.
+    fn authenticated(&mut self) -> std::io::Result<()> {
+        self.deadline = None;
+        self.inner.set_read_timeout(None)
+    }
+
+    fn expired(&self) -> std::io::Error {
+        let secs = self.limit.as_secs_f64();
+        std::io::Error::new(std::io::ErrorKind::TimedOut, format!("not authenticated within {secs} s of connecting; closing the connection"))
+    }
+}
+
+impl<R: Read + ReadTimeout> Read for AuthDeadlineRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(deadline) = self.deadline else { return self.inner.read(buf) };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(self.expired());
+        }
+        self.inner.set_read_timeout(Some(left))?;
+        match self.inner.read(buf) {
+            // The socket timeout is what was left of the deadline.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Err(self.expired()),
+            other => other,
+        }
+    }
+}
+
 /// The reply to anything but a valid `auth` on a connection that hasn't authenticated.
 const AUTH_REQUIRED: &str = "authentication required: the first request must be {\"method\":\"auth\",\"params\":{\"token\":…}} \
      with the token from control-<port>.token in the EffectCraft settings folder; closing the connection";
@@ -175,10 +240,17 @@ fn gate(authenticated: &mut bool, method: &str, params: &Value, token: &str) -> 
 }
 
 /// Serve requests from `read`, answering on `out`, until the peer closes, sends something that is
-/// not a request, fails to authenticate with `token` first, or `handle` returns `None` (app gone).
-/// `handle` gets `(method, params)` and returns the reply object (the request's `id` is added here).
-fn serve_lines<R: Read, W: Write>(read: R, mut out: W, token: &str, mut handle: impl FnMut(String, Value) -> Option<Value>) {
-    let mut reader = BufReader::new(read);
+/// not a request, fails to authenticate with `token` within `auth_deadline` of connecting, or
+/// `handle` returns `None` (app gone). `handle` gets `(method, params)` and returns the reply
+/// object (the request's `id` is added here).
+fn serve_lines<R: Read + ReadTimeout, W: Write>(
+    read: R,
+    mut out: W,
+    token: &str,
+    auth_deadline: Duration,
+    mut handle: impl FnMut(String, Value) -> Option<Value>,
+) {
+    let mut reader = BufReader::new(AuthDeadlineRead::new(read, auth_deadline));
     let mut buf = Vec::new();
     let mut authenticated = false;
     loop {
@@ -189,9 +261,15 @@ fn serve_lines<R: Read, W: Write>(read: R, mut out: W, token: &str, mut handle: 
                 Line::Blank => continue,
                 Line::Reject(e) => e,
                 Line::Request { id, method, params } => {
+                    let was_authenticated = authenticated;
                     let reply = match gate(&mut authenticated, &method, &params, token) {
                         Gate::Dispatch => handle(method, params),
-                        Gate::Reply(r) => Some(r),
+                        Gate::Reply(r) => {
+                            if authenticated && !was_authenticated && reader.get_mut().authenticated().is_err() {
+                                return;
+                            }
+                            Some(r)
+                        }
                         Gate::Close(e) => {
                             let _ = writeln!(out, "{}", json!({"id": id, "ok": false, "error": e})).and_then(|()| out.flush());
                             return;
@@ -229,7 +307,7 @@ mod tests {
     fn run_raw(input: &[u8]) -> (Vec<Value>, Vec<String>) {
         let mut out = Vec::new();
         let mut calls = Vec::new();
-        serve_lines(input, &mut out, TOKEN, |m, _p| {
+        serve_lines(input, &mut out, TOKEN, AUTH_DEADLINE, |m, _p| {
             calls.push(m);
             Some(json!({"ok": true, "result": null}))
         });
@@ -364,7 +442,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
             let read = s.try_clone().unwrap();
-            serve_lines(read, s, TOKEN, |_, _| Some(json!({"ok": true})));
+            serve_lines(read, s, TOKEN, AUTH_DEADLINE, |_, _| Some(json!({"ok": true})));
         });
         let mut c = TcpStream::connect(addr).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -394,7 +472,7 @@ mod tests {
             for _ in 0..2 {
                 let (s, _) = listener.accept().unwrap();
                 let read = s.try_clone().unwrap();
-                serve_lines(read, s, &served, |m, _| Some(json!({"ok": true, "result": {"method": m}})));
+                serve_lines(read, s, &served, AUTH_DEADLINE, |m, _| Some(json!({"ok": true, "result": {"method": m}})));
             }
         });
         let mut client = BridgeClient::new(&port.to_string(), TokenSource::for_addr(&port.to_string(), Some(&dir))).unwrap();
@@ -412,7 +490,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, _rx) = channel::<ControlRequest>();
-        std::thread::spawn(move || accept_loop(listener, tx, egui::Context::default(), TOKEN.into()));
+        std::thread::spawn(move || accept_loop(listener, tx, egui::Context::default(), TOKEN.into(), AUTH_DEADLINE));
         // Idle connections are accepted in order and held open.
         let held: Vec<TcpStream> = (0..16).map(|_| TcpStream::connect(addr).unwrap()).collect();
         let mut extra = TcpStream::connect(addr).unwrap();
@@ -421,5 +499,77 @@ mod tests {
         BufReader::new(&mut extra).read_line(&mut line).unwrap();
         assert!(line.contains("too many control connections"), "{line}");
         drop(held);
+    }
+
+    /// Connections that don't authenticate in time are closed and free their slots, whether they
+    /// stay silent or drip a byte at a time.
+    #[test]
+    fn unauthenticated_connections_are_closed_at_the_deadline() {
+        let deadline = Duration::from_millis(300);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = channel::<ControlRequest>();
+        std::thread::spawn(move || accept_loop(listener, tx, egui::Context::default(), TOKEN.into(), deadline));
+        let start = Instant::now();
+        let idle: Vec<TcpStream> = (0..MAX_CONNECTIONS - 1).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        let drip = TcpStream::connect(addr).unwrap();
+        let mut writer = drip.try_clone().unwrap();
+        std::thread::spawn(move || {
+            while start.elapsed() < Duration::from_secs(5) {
+                let _ = writer.write_all(b" ");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        for c in &idle {
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut text = String::new();
+            (&mut &*c).read_to_string(&mut text).unwrap(); // EOF: the server closed it
+            assert!(text.contains("not authenticated within 0.3 s"), "{text}");
+        }
+        drip.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Closed (EOF or reset, as unread drip bytes may make the close a reset), not timed out.
+        let mut text = String::new();
+        if let Err(e) = (&mut &drip).read_to_string(&mut text) {
+            assert!(!matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut), "still open: {e}");
+        }
+        assert!(start.elapsed() < Duration::from_secs(3), "the drip extended the deadline: {:?}", start.elapsed());
+        // The slots are free again: a new client authenticates.
+        let mut reply = String::new();
+        for _ in 0..50 {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            c.write_all(auth_line(TOKEN).as_bytes()).unwrap();
+            reply.clear();
+            BufReader::new(&mut c).read_line(&mut reply).unwrap();
+            if !reply.contains("too many") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(reply.contains("\"authenticated\":true"), "{reply}");
+    }
+
+    /// Once authenticated, the deadline no longer applies.
+    #[test]
+    fn authenticated_connections_outlive_the_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let read = s.try_clone().unwrap();
+            serve_lines(read, s, TOKEN, Duration::from_millis(200), |_, _| Some(json!({"ok": true})));
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(auth_line(TOKEN).as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        c.write_all(b"{\"id\":2,\"method\":\"x\"}\n").unwrap();
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut text = String::new();
+        c.read_to_string(&mut text).unwrap();
+        server.join().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[1].contains("\"id\":2") && lines[1].contains("\"ok\":true"), "{text}");
     }
 }
