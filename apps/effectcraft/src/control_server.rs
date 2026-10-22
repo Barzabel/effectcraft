@@ -475,7 +475,8 @@ mod tests {
                 serve_lines(read, s, &served, AUTH_DEADLINE, |m, _| Some(json!({"ok": true, "result": {"method": m}})));
             }
         });
-        let mut client = BridgeClient::new(&port.to_string(), TokenSource::for_addr(&port.to_string(), Some(&dir))).unwrap();
+        // Explicit inputs: an inherited EFFECTCRAFT_CONTROL_TOKEN(_FILE) must not pick the token.
+        let mut client = BridgeClient::new(&port.to_string(), TokenSource::from_inputs(&port.to_string(), None, None, Some(&dir))).unwrap();
         assert_eq!(client.call("engine.execute", json!({})).unwrap()["method"].as_str(), Some("engine.execute"));
         drop(client);
         let mut stale = BridgeClient::new(&port.to_string(), TokenSource::Token(control_auth::generate_token().unwrap())).unwrap();
