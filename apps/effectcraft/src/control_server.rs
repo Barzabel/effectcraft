@@ -214,7 +214,8 @@ impl<R: Read + ReadTimeout> Read for AuthDeadlineRead<R> {
 
 /// The reply to anything but a valid `auth` on a connection that hasn't authenticated.
 const AUTH_REQUIRED: &str = "authentication required: the first request must be {\"method\":\"auth\",\"params\":{\"token\":…}} \
-     with the token from control-<port>.token in the EffectCraft settings folder; closing the connection";
+     with the token from control-<port>.token in the EffectCraft settings folder, or from the file EFFECTCRAFT_CONTROL_TOKEN_FILE names; \
+     closing the connection";
 
 /// What happens to a request, given whether the connection has authenticated (#2122).
 enum Gate {
