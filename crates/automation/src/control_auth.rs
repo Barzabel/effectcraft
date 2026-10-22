@@ -148,7 +148,7 @@ pub fn port_of(addr: &str) -> Option<u16> {
 }
 
 /// Where a client gets the control token from. Read on every (re)connect.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum TokenSource {
     /// A token given directly (`EFFECTCRAFT_CONTROL_TOKEN`, tests).
     Token(String),
@@ -156,6 +156,17 @@ pub enum TokenSource {
     File(PathBuf),
     /// No token can be found; the reason is reported when connecting.
     Missing(String),
+}
+
+/// Never prints the token itself, so `{:?}` in logs or errors can't leak it.
+impl std::fmt::Debug for TokenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenSource::Token(_) => f.write_str("Token(<redacted>)"),
+            TokenSource::File(path) => f.debug_tuple("File").field(path).finish(),
+            TokenSource::Missing(why) => f.debug_tuple("Missing").field(why).finish(),
+        }
+    }
 }
 
 impl TokenSource {
@@ -261,5 +272,12 @@ mod tests {
         assert!(TokenSource::Token("short".into()).token().is_err());
         let missing = TokenSource::File(temp_dir("missing").join("control-1.token")).token().unwrap_err().to_string();
         assert!(missing.contains("--control"), "{missing}");
+    }
+
+    #[test]
+    fn debug_output_redacts_the_token() {
+        let t = "cd".repeat(32);
+        let shown = format!("{:?} {:?}", TokenSource::Token(t.clone()), TokenSource::File("/cfg/control-1.token".into()));
+        assert!(!shown.contains(&t) && shown.contains("redacted") && shown.contains("control-1.token"), "{shown}");
     }
 }
