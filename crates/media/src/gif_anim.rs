@@ -94,13 +94,13 @@ impl Anim {
             return crate::webp_anim::load(bytes);
         }
         let mut dec = GifDecoder::new(Cursor::new(bytes)).map_err(|e| MediaError::Decode(format!("GIF: {e}")))?;
-        // Every frame is composited onto a full canvas: refuse a canvas too large to hold before
-        // decoding any (a few dozen bytes can claim 65535×65535), and keep the decoder's own
-        // buffers within the decode budget (#2130).
+        // Every frame is composited onto a full canvas and shown as an f32 `Image`: refuse a canvas
+        // too large to hold before decoding any (a few dozen bytes can claim 65535×65535), and
+        // keep the decoder's own buffers within the decode budget (#2130).
         let limits = crate::probe::decode_limits();
         let (w, h) = dec.dimensions();
         let canvas = u64::from(w) * u64::from(h) * 4;
-        if canvas > limits.max_alloc.unwrap_or(u64::MAX) {
+        if canvas > limits.max_alloc.unwrap_or(u64::MAX) || !crate::probe::fits_as_image(w, h) {
             return Err(MediaError::Unsupported(format!("GIF of {w}×{h} is too large to hold in memory")));
         }
         dec.set_limits(limits).map_err(|e| MediaError::Unsupported(format!("GIF of {w}×{h}: {e}")))?;
@@ -233,6 +233,22 @@ mod tests {
             enc.write_frame(&gif::Frame::from_rgb(2, 2, &RED.repeat(4))).unwrap();
         }
         assert!(bytes.len() < 200);
+        match super::Anim::load(&bytes) {
+            Err(crate::MediaError::Unsupported(_)) => {}
+            Err(e) => panic!("expected the canvas to be refused as too large, got {e}"),
+            Ok(_) => panic!("expected the canvas to be refused as too large, it decoded"),
+        }
+    }
+
+    #[test]
+    fn a_gif_canvas_too_big_once_widened_to_float_is_refused() {
+        // 9000×9000: 324 MB of RGBA canvas, inside the decode budget, but each frame becomes an
+        // f32 RGBA `Image` of 1.3 GB, over what one picture may cost.
+        let mut bytes = Vec::new();
+        {
+            let mut enc = gif::Encoder::new(&mut bytes, 9_000, 9_000, &[]).unwrap();
+            enc.write_frame(&gif::Frame::from_rgb(2, 2, &RED.repeat(4))).unwrap();
+        }
         match super::Anim::load(&bytes) {
             Err(crate::MediaError::Unsupported(_)) => {}
             Err(e) => panic!("expected the canvas to be refused as too large, got {e}"),
